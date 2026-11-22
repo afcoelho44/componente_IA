@@ -1,5 +1,5 @@
 """
-Testes da API de correção de distância.  Rodar: pytest -q
+Testes da API de classificação da proximidade.  Rodar: pytest -q
 Treinam um modelo com o CSV falso (gerar_falso.py) numa pasta temporária.
 """
 import subprocess
@@ -7,14 +7,17 @@ import sys
 from pathlib import Path
 
 import joblib
+import numpy as np
 import pandas as pd
 import pytest
 
 import app as api
 from gerar_falso import gerar
-from modelo_dist import FEATURES, montar_X
+from modelo_classe import CLASSES, FEATURES, classe_por_distancia, montar_X, preparar
 
 RAIZ = Path(__file__).resolve().parents[1]
+OBJ = {'lat': -26.2535, 'lng': -48.8555}
+M_LAT = 111_320.0
 
 
 @pytest.fixture(scope='session')
@@ -22,7 +25,8 @@ def pacote(tmp_path_factory):
     pasta = tmp_path_factory.mktemp('ia')
     csv, modelo = pasta / 'falso.csv', pasta / 'modelo.joblib'
     gerar().to_csv(csv, index=False)
-    subprocess.run([sys.executable, str(RAIZ / 'treinar.py'), str(csv), str(modelo)],
+    subprocess.run([sys.executable, str(RAIZ / 'treinar.py'), str(csv), str(modelo),
+                    '--saida-validacao', str(pasta / 'validacao')],
                    check=True, cwd=RAIZ, capture_output=True)
     return joblib.load(modelo)
 
@@ -34,67 +38,91 @@ def cliente(pacote, monkeypatch):
     return api.app.test_client()
 
 
-def corrigir(cliente, **dados):
-    return cliente.post('/corrigir', json=dados)
+def leituras_a(metros_ao_sul, n=5, accuracy=4.0):
+    lat = OBJ['lat'] - metros_ao_sul / M_LAT
+    return [{'lat': lat, 'lng': OBJ['lng'], 'accuracy': accuracy, 'speed': 0, 't_ms': 1000 * i} for i in range(n)]
+
+
+def classificar(cliente, leituras, dispositivo='Android'):
+    return cliente.post('/classificar', json={'objeto': OBJ, 'leituras': leituras, 'dispositivo': dispositivo})
+
+
+def test_limites():
+    assert list(classe_por_distancia([0, 10, 10.01, 15, 15.01, 100])) == \
+        ['quente', 'quente', 'morno', 'morno', 'frio', 'frio']
+    assert classe_por_distancia(12) == 'morno'
 
 
 def test_saude(cliente):
     r = cliente.get('/saude')
-    assert r.status_code == 200 and r.json['ok']
+    assert r.status_code == 200 and r.json['ok'] and r.json['classes']
 
 
 def test_sem_modelo_503(monkeypatch):
     monkeypatch.setattr(api, 'PACOTE', None)
     c = api.app.test_client()
     assert c.get('/saude').status_code == 503
-    assert c.post('/corrigir', json={'d_gps_m': 10}).status_code == 503
+    assert classificar(c, leituras_a(5)).status_code == 503
 
 
-def test_corrige_vies(cliente):
-    # no CSV falso o GPS mede a mais (+2 m outdoor, +6 m indoor): na média,
-    # a distância corrigida tem que ficar sem viés em relação à fita
-    amostra = gerar(n_participantes=2, seed=1).query("fluxo == 'bruto'").sample(300, random_state=0)
-    erros = []
-    for _, l in amostra.iterrows():
-        r = corrigir(cliente, d_gps_m=l.d_gps_m, accuracy=l.accuracy,
-                     ambiente=l.ambiente, dispositivo=l.dispositivo_curto)
-        assert r.status_code == 200 and not r.json['fora_da_faixa']
-        erros.append(r.json['dist_m'] - l.distancia_m)
-    vies_corrigido = sum(erros) / len(erros)
-    vies_gps = (amostra.d_gps_m - amostra.distancia_m).mean()
-    assert abs(vies_corrigido) < 1.0 < vies_gps
+@pytest.mark.parametrize('metros, esperada', [(2, 'quente'), (22, 'frio')])
+def test_classes_claras(cliente, metros, esperada):
+    r = classificar(cliente, leituras_a(metros))
+    assert r.status_code == 200
+    assert r.json['classe'] == esperada and r.json['fonte'] == 'ia'
+    assert set(r.json['probabilidades']) == set(CLASSES)
+    assert sum(r.json['probabilidades'].values()) == pytest.approx(1, abs=0.01)
 
 
-def test_iphone_sozinho(cliente):
-    # uma linha só com iPhone: one-hot não pode perder colunas
-    r = corrigir(cliente, d_gps_m=15, accuracy=12, ambiente='indoor', dispositivo='iPhone')
+def test_dist_m(cliente):
+    assert classificar(cliente, leituras_a(12)).json['dist_m'] == pytest.approx(12, abs=0.1)
+
+
+def test_longe_demais_usa_regra(cliente, pacote):
+    r = classificar(cliente, leituras_a(pacote['dist_max_treino'] * 3))
+    assert r.json['fonte'] == 'regra' and r.json['classe'] == 'frio'
+
+
+def test_uma_leitura_so_e_iphone(cliente):
+    r = classificar(cliente, leituras_a(5, n=1), dispositivo='iPhone')
     assert r.status_code == 200
 
 
-def test_accuracy_nula(cliente):
-    assert corrigir(cliente, d_gps_m=15, accuracy=None, ambiente='outdoor').status_code == 200
+def test_campos_opcionais_nulos(cliente):
+    leituras = [{'lat': l['lat'], 'lng': l['lng'], 'accuracy': None, 'speed': None} for l in leituras_a(8)]
+    assert classificar(cliente, leituras).status_code == 200
 
 
-@pytest.mark.parametrize('dados', [{}, {'d_gps_m': -1}, {'d_gps_m': 'abc'}, {'accuracy': 5}])
-def test_entrada_invalida_400(cliente, dados):
-    assert cliente.post('/corrigir', json=dados).status_code == 400
+def test_muitas_leituras_corta(cliente):
+    assert classificar(cliente, leituras_a(5, n=200)).status_code == 200
+
+
+@pytest.mark.parametrize('corpo', [
+    {},
+    {'objeto': OBJ},
+    {'objeto': OBJ, 'leituras': []},
+    {'objeto': {'lat': 'x', 'lng': 1}, 'leituras': leituras_a(5)},
+    {'objeto': OBJ, 'leituras': [{'lat': 200, 'lng': 0}]},
+    {'objeto': OBJ, 'leituras': ['abc']},
+])
+def test_entrada_invalida_400(cliente, corpo):
+    assert cliente.post('/classificar', json=corpo).status_code == 400
 
 
 def test_sem_json_400(cliente):
-    assert cliente.post('/corrigir', data='x').status_code == 400
+    assert cliente.post('/classificar', data='x').status_code == 400
 
 
-def test_fora_da_faixa_nao_corrige(cliente, pacote):
-    longe = pacote['faixa_d_gps'][1] * 3
-    r = corrigir(cliente, d_gps_m=longe, accuracy=5, ambiente='outdoor', dispositivo='Android')
-    assert r.json['fora_da_faixa'] and r.json['dist_m'] == pytest.approx(longe, abs=0.01)
+def test_features_so_usam_o_passado():
+    # mudar uma leitura futura não pode mudar as features das anteriores
+    df = gerar(n_participantes=1).head(30).rename(columns={'t_gps_s': 't'})
+    antes = preparar(df)[FEATURES].iloc[:20].to_numpy()
+    df.loc[25, 'lat'] += 0.001
+    depois = preparar(df)[FEATURES].iloc[:20].to_numpy()
+    assert np.allclose(antes, depois)
 
 
-def test_distancia_nunca_negativa(cliente):
-    assert corrigir(cliente, d_gps_m=0, accuracy=15, ambiente='indoor').json['dist_m'] >= 0
-
-
-def test_montar_X_mesmas_colunas():
-    uma = montar_X(pd.DataFrame([{'d_gps_m': 5, 'accuracy': 3, 'ambiente': 'indoor', 'dispositivo': 'iPhone'}]))
-    varias = montar_X(gerar(n_participantes=2).head(50))
-    assert list(uma.columns) == list(varias.columns) == FEATURES
+def test_montar_X_colunas():
+    df = preparar(pd.DataFrame([{'captura_id': 1, 't': 0, 'lat': -26.25, 'lng': -48.85,
+                                 'obj_lat': -26.25, 'obj_lng': -48.85, 'accuracy': 3}]))
+    assert list(montar_X(df).columns) == FEATURES
