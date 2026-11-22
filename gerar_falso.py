@@ -1,39 +1,44 @@
 """
-gerar_falso.py — CSV falso no formato do erro_distancia_por_leitura.csv, para testar
-o treino e a API antes da coleta real com fita.
+gerar_falso.py — CSV falso no formato do leituras_processadas.csv (analisar.py), para
+testar o treino e a API sem os dados reais.
 
 Uso: python gerar_falso.py dados/falso.csv
 
-Regra embutida (o modelo tem que "descobrir"):
-  outdoor: o GPS mede +2 m a mais;  indoor: +6 m;  iPhone: -1 m;  ruído ~ accuracy / 2
+Cada participante fica parado ~60 s em cada marca da fita (0, 5, 10, 15, 20, 25 m),
+em dois pontos. O GPS tem um desvio fixo por captura (como nos dados reais) mais ruído.
 """
 import sys
 
 import numpy as np
 import pandas as pd
 
+M_LAT = 111_320.0
 
-def gerar(n_participantes=6, seed=0):
+
+def gerar(n_participantes=4, seed=0):
     rng = np.random.default_rng(seed)
-    linhas = []
-    cap = 0
+    pontos = {'Ponto A': (-26.2535, -48.8555), 'Ponto B': (-26.2532, -48.8558)}
+    linhas, cap = [], 0
     for p in range(1, n_participantes + 1):
         disp = 'iPhone' if p % 2 else 'Android'
-        for amb in ('indoor', 'outdoor'):
-            for dist in (5, 10, 15, 20, 25, 30):
-                for rep in (1, 2, 3):
-                    cap += 1
-                    acc = rng.uniform(3, 8) if amb == 'outdoor' else rng.uniform(8, 18)
-                    vies = (2 if amb == 'outdoor' else 6) - (1 if disp == 'iPhone' else 0)
-                    for t in range(30):
-                        d_gps = max(0.0, dist + vies + rng.normal(0, acc / 2))
-                        for fluxo in ('bruto', 'kalman'):
-                            linhas.append({
-                                'fluxo': fluxo, 'captura_id': cap, 'participante': f'P{p:02d}',
-                                'dispositivo_curto': disp, 'ambiente': amb, 'local': 'Ponto A',
-                                'distancia_m': dist, 'repeticao': rep, 't_ms': t * 1000,
-                                'accuracy': round(acc, 1), 'd_gps_m': d_gps, 'erro_m': d_gps - dist,
-                            })
+        for local, (olat, olng) in pontos.items():
+            m_lng = M_LAT * np.cos(np.radians(olat))
+            for dist in (0, 5, 10, 15, 20, 25):
+                cap += 1
+                acc = rng.uniform(3, 6)
+                desvio = rng.normal(0, 2.5, size=2)        # desvio fixo da captura (m)
+                for k in range(60):
+                    norte = -dist + desvio[0] + rng.normal(0, acc / 3)   # a fita vai para o sul
+                    leste = desvio[1] + rng.normal(0, acc / 3)
+                    linhas.append({
+                        'captura_id': f'c{cap}', 'participante': f'P{p:02d}', 'local': local,
+                        'ambiente': 'outdoor', 'distancia_m': float(dist), 'repeticao': 1,
+                        'dispositivo_curto': disp, 't_ms': k * 1000, 't_gps_s': 1_700_000_000 + cap * 100 + k,
+                        'lat': olat + norte / M_LAT, 'lng': olng + leste / m_lng,
+                        'accuracy': round(acc + rng.normal(0, 0.3), 2),
+                        'speed': abs(rng.normal(0, 0.2)) if disp == 'Android' else np.nan,
+                        'obj_lat': olat, 'obj_lng': olng, 'avaliar': k >= 15,
+                    })
     return pd.DataFrame(linhas)
 
 

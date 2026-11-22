@@ -1,4 +1,4 @@
 __pycache__/
 .venv/
 dados/*.csv
-modelos/*.joblib
+modelos/*.joblibdados/validacao/
